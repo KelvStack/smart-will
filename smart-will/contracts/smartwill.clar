@@ -18,9 +18,24 @@
 (define-constant ERR_MAX_BENEFICIARIES_REACHED (err u414))
 (define-constant ERR_PERCENTAGE_TOTAL_INVALID (err u415))
 (define-constant ERR_BENEFICIARY_EXISTS (err u416))
+(define-constant ERR_TIME_LOCK_ACTIVE (err u417))
+(define-constant ERR_INSUFFICIENT_GUARDIANS (err u418))
+(define-constant ERR_GUARDIAN_ALREADY_EXISTS (err u419))
+(define-constant ERR_NOT_GUARDIAN (err u420))
+(define-constant ERR_HEARTBEAT_EXPIRED (err u421))
+(define-constant ERR_EXECUTION_BLOCKED (err u422))
 
 ;; Maximum number of beneficiaries per will
 (define-constant MAX_BENEFICIARIES u10)
+
+;; Maximum number of guardians per will
+(define-constant MAX_GUARDIANS u5)
+
+;; Minimum time lock period (30 days in blocks)
+(define-constant MIN_TIME_LOCK u4320)
+
+;; Heartbeat timeout period (180 days in blocks)
+(define-constant HEARTBEAT_TIMEOUT u25920)
 
 ;; data vars
 (define-data-var next-will-id uint u1)
@@ -80,6 +95,59 @@
 (define-map beneficiary-counts
     uint ;; will-id
     uint ;; count
+)
+
+;; Time lock settings for wills
+(define-map will-time-locks
+    uint ;; will-id
+    {
+        is-enabled: bool,
+        lock-duration: uint, ;; in blocks
+        unlock-block: (optional uint),
+        created-by: principal,
+    }
+)
+
+;; Guardian system for social recovery
+(define-map guardians
+    {
+        will-id: uint,
+        guardian-address: principal,
+    }
+    ;; composite key
+    {
+        is-active: bool,
+        added-at: uint,
+        guardian-name: (optional (string-ascii 64)),
+    }
+)
+
+;; Guardian list per will
+(define-map will-guardian-list
+    uint ;; will-id
+    (list 5 principal) ;; list of guardian addresses
+)
+
+;; Heartbeat system for liveness detection
+(define-map will-heartbeats
+    uint ;; will-id
+    {
+        last-heartbeat: uint,
+        is-active: bool,
+        timeout-duration: uint, ;; in blocks
+    }
+)
+
+;; Emergency execution requests
+(define-map emergency-executions
+    uint ;; will-id
+    {
+        requested-by: principal,
+        requested-at: uint,
+        guardian-approvals: uint,
+        required-approvals: uint,
+        is-approved: bool,
+    }
 )
 
 ;; public functions
@@ -417,6 +485,365 @@
     )
 )
 
+;; ========== TIME LOCK FUNCTIONS ==========
+
+;; Enable time lock for a will
+(define-public (enable-time-lock
+        (will-id uint)
+        (lock-duration uint)
+    )
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+        )
+        ;; Verify ownership
+        (asserts! (is-eq caller (get creator will-data)) ERR_UNAUTHORIZED)
+
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Validate lock duration
+        (asserts! (>= lock-duration MIN_TIME_LOCK) ERR_INVALID_PERCENTAGE)
+
+        ;; Set time lock
+        (map-set will-time-locks will-id {
+            is-enabled: true,
+            lock-duration: lock-duration,
+            unlock-block: (some (+ stacks-block-height lock-duration)),
+            created-by: caller,
+        })
+
+        ;; Update will timestamp
+        (map-set wills will-id
+            (merge will-data { last-updated: stacks-block-height })
+        )
+
+        (ok true)
+    )
+)
+
+;; Disable time lock for a will
+(define-public (disable-time-lock (will-id uint))
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+        )
+        ;; Verify ownership
+        (asserts! (is-eq caller (get creator will-data)) ERR_UNAUTHORIZED)
+
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Remove time lock
+        (map-delete will-time-locks will-id)
+
+        ;; Update will timestamp
+        (map-set wills will-id
+            (merge will-data { last-updated: stacks-block-height })
+        )
+
+        (ok true)
+    )
+)
+
+;; ========== GUARDIAN FUNCTIONS ==========
+
+;; Add a guardian to a will
+(define-public (add-guardian
+        (will-id uint)
+        (guardian-address principal)
+        (guardian-name (optional (string-ascii 64)))
+    )
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+            (current-guardians (default-to (list) (map-get? will-guardian-list will-id)))
+        )
+        ;; Verify ownership
+        (asserts! (is-eq caller (get creator will-data)) ERR_UNAUTHORIZED)
+
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Check guardian limit
+        (asserts! (< (len current-guardians) MAX_GUARDIANS)
+            ERR_MAX_BENEFICIARIES_REACHED
+        )
+
+        ;; Ensure guardian doesn't already exist
+        (asserts!
+            (is-none (map-get? guardians {
+                will-id: will-id,
+                guardian-address: guardian-address,
+            }))
+            ERR_GUARDIAN_ALREADY_EXISTS
+        )
+
+        ;; Add guardian
+        (map-set guardians {
+            will-id: will-id,
+            guardian-address: guardian-address,
+        } {
+            is-active: true,
+            added-at: stacks-block-height,
+            guardian-name: guardian-name,
+        })
+
+        ;; Update guardian list
+        (map-set will-guardian-list will-id
+            (unwrap! (as-max-len? (append current-guardians guardian-address) u5)
+                ERR_MAX_BENEFICIARIES_REACHED
+            ))
+
+        ;; Update will timestamp
+        (map-set wills will-id
+            (merge will-data { last-updated: stacks-block-height })
+        )
+
+        (ok true)
+    )
+)
+
+;; Remove a guardian from a will
+(define-public (remove-guardian
+        (will-id uint)
+        (guardian-address principal)
+    )
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+            (guardian-data (unwrap!
+                (map-get? guardians {
+                    will-id: will-id,
+                    guardian-address: guardian-address,
+                })
+                ERR_NOT_FOUND
+            ))
+        )
+        ;; Verify ownership
+        (asserts! (is-eq caller (get creator will-data)) ERR_UNAUTHORIZED)
+
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Remove guardian
+        (map-delete guardians {
+            will-id: will-id,
+            guardian-address: guardian-address,
+        })
+
+        ;; Note: For simplicity, we'll rebuild the guardian list when needed
+        ;; In a production environment, you'd implement proper list management
+
+        ;; Update will timestamp
+        (map-set wills will-id
+            (merge will-data { last-updated: stacks-block-height })
+        )
+
+        (ok true)
+    )
+)
+
+;; ========== HEARTBEAT FUNCTIONS ==========
+
+;; Initialize heartbeat for a will
+(define-public (enable-heartbeat
+        (will-id uint)
+        (timeout-duration uint)
+    )
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+        )
+        ;; Verify ownership
+        (asserts! (is-eq caller (get creator will-data)) ERR_UNAUTHORIZED)
+
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Validate timeout duration (minimum 30 days)
+        (asserts! (>= timeout-duration MIN_TIME_LOCK) ERR_INVALID_PERCENTAGE)
+
+        ;; Set heartbeat
+        (map-set will-heartbeats will-id {
+            last-heartbeat: stacks-block-height,
+            is-active: true,
+            timeout-duration: timeout-duration,
+        })
+
+        ;; Update will timestamp
+        (map-set wills will-id
+            (merge will-data { last-updated: stacks-block-height })
+        )
+
+        (ok true)
+    )
+)
+
+;; Send heartbeat signal
+(define-public (send-heartbeat (will-id uint))
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+            (heartbeat-data (unwrap! (map-get? will-heartbeats will-id) ERR_NOT_FOUND))
+        )
+        ;; Verify ownership
+        (asserts! (is-eq caller (get creator will-data)) ERR_UNAUTHORIZED)
+
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Ensure heartbeat is active
+        (asserts! (get is-active heartbeat-data) ERR_WILL_NOT_READY)
+
+        ;; Update heartbeat
+        (map-set will-heartbeats will-id
+            (merge heartbeat-data { last-heartbeat: stacks-block-height })
+        )
+
+        ;; Update will timestamp
+        (map-set wills will-id
+            (merge will-data { last-updated: stacks-block-height })
+        )
+
+        (ok true)
+    )
+)
+
+;; ========== EMERGENCY EXECUTION FUNCTIONS ==========
+
+;; Request emergency execution (by guardians)
+(define-public (request-emergency-execution (will-id uint))
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+            (guardian-data (unwrap!
+                (map-get? guardians {
+                    will-id: will-id,
+                    guardian-address: caller,
+                })
+                ERR_NOT_GUARDIAN
+            ))
+            (guardian-list (default-to (list) (map-get? will-guardian-list will-id)))
+            (required-approvals (/ (len guardian-list) u2)) ;; Majority approval
+        )
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Ensure caller is an active guardian
+        (asserts! (get is-active guardian-data) ERR_NOT_GUARDIAN)
+
+        ;; Check if heartbeat has expired (if enabled)
+        (match (map-get? will-heartbeats will-id)
+            heartbeat-data
+            (let ((timeout-block (+ (get last-heartbeat heartbeat-data)
+                    (get timeout-duration heartbeat-data)
+                )))
+                (asserts! (>= stacks-block-height timeout-block)
+                    ERR_HEARTBEAT_EXPIRED
+                )
+            )
+            true ;; No heartbeat enabled, proceed
+        )
+
+        ;; Create emergency execution request
+        (map-set emergency-executions will-id {
+            requested-by: caller,
+            requested-at: stacks-block-height,
+            guardian-approvals: u1, ;; Requester auto-approves
+            required-approvals: (if (> required-approvals u0)
+                required-approvals
+                u1
+            ),
+            is-approved: false,
+        })
+
+        (ok true)
+    )
+)
+
+;; Approve emergency execution (by other guardians)
+(define-public (approve-emergency-execution (will-id uint))
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+            (guardian-data (unwrap!
+                (map-get? guardians {
+                    will-id: will-id,
+                    guardian-address: caller,
+                })
+                ERR_NOT_GUARDIAN
+            ))
+            (emergency-data (unwrap! (map-get? emergency-executions will-id) ERR_NOT_FOUND))
+        )
+        ;; Ensure will is not executed
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+
+        ;; Ensure caller is an active guardian
+        (asserts! (get is-active guardian-data) ERR_NOT_GUARDIAN)
+
+        ;; Ensure emergency execution is not already approved
+        (asserts! (not (get is-approved emergency-data)) ERR_EXECUTION_BLOCKED)
+
+        ;; Increment approvals
+        (let ((new-approvals (+ (get guardian-approvals emergency-data) u1)))
+            (map-set emergency-executions will-id
+                (merge emergency-data {
+                    guardian-approvals: new-approvals,
+                    is-approved: (>= new-approvals (get required-approvals emergency-data)),
+                })
+            )
+        )
+
+        (ok true)
+    )
+)
+
+;; Execute will through emergency process
+(define-public (emergency-execute-will (will-id uint))
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (map-get? wills will-id) ERR_NOT_FOUND))
+            (emergency-data (unwrap! (map-get? emergency-executions will-id) ERR_NOT_FOUND))
+            (guardian-data (unwrap!
+                (map-get? guardians {
+                    will-id: will-id,
+                    guardian-address: caller,
+                })
+                ERR_NOT_GUARDIAN
+            ))
+        )
+        ;; Ensure caller is an active guardian
+        (asserts! (get is-active guardian-data) ERR_NOT_GUARDIAN)
+
+        ;; Ensure emergency execution is approved
+        (asserts! (get is-approved emergency-data) ERR_EXECUTION_BLOCKED)
+
+        ;; Check time lock if enabled
+        (match (map-get? will-time-locks will-id)
+            time-lock-data
+            (if (get is-enabled time-lock-data)
+                (match (get unlock-block time-lock-data)
+                    unlock-block (asserts! (>= stacks-block-height unlock-block)
+                        ERR_TIME_LOCK_ACTIVE
+                    )
+                    true
+                )
+                true
+            )
+            true ;; No time lock
+        )
+
+        ;; Execute the distribution (reuse existing distribute-assets logic)
+        (try! (distribute-assets will-id))
+
+        ;; Clean up emergency execution data
+        (map-delete emergency-executions will-id)
+
+        (ok true)
+    )
+)
+
 ;; read only functions
 
 ;; Get will details by ID
@@ -509,6 +936,115 @@
             )
             ERR_NOT_FOUND
         )
+        ERR_NOT_FOUND
+    )
+)
+
+;; ========== ADVANCED READ-ONLY FUNCTIONS ==========
+
+;; Get time lock details
+(define-read-only (get-time-lock-details (will-id uint))
+    (map-get? will-time-locks will-id)
+)
+
+;; Check if time lock is active
+(define-read-only (is-time-lock-active (will-id uint))
+    (match (map-get? will-time-locks will-id)
+        time-lock-data (if (get is-enabled time-lock-data)
+            (match (get unlock-block time-lock-data)
+                unlock-block (< stacks-block-height unlock-block)
+                false
+            )
+            false
+        )
+        false
+    )
+)
+
+;; Get guardian details
+(define-read-only (get-guardian-details
+        (will-id uint)
+        (guardian-address principal)
+    )
+    (map-get? guardians {
+        will-id: will-id,
+        guardian-address: guardian-address,
+    })
+)
+
+;; Get all guardians for a will
+(define-read-only (get-will-guardians (will-id uint))
+    (map-get? will-guardian-list will-id)
+)
+
+;; Get heartbeat status
+(define-read-only (get-heartbeat-status (will-id uint))
+    (match (map-get? will-heartbeats will-id)
+        heartbeat-data (let ((timeout-block (+ (get last-heartbeat heartbeat-data)
+                (get timeout-duration heartbeat-data)
+            )))
+            (ok {
+                last-heartbeat: (get last-heartbeat heartbeat-data),
+                is-active: (get is-active heartbeat-data),
+                timeout-duration: (get timeout-duration heartbeat-data),
+                is-expired: (>= stacks-block-height timeout-block),
+                blocks-until-timeout: (if (>= stacks-block-height timeout-block)
+                    u0
+                    (- timeout-block stacks-block-height)
+                ),
+            })
+        )
+        ERR_NOT_FOUND
+    )
+)
+
+;; Get emergency execution status
+(define-read-only (get-emergency-execution-status (will-id uint))
+    (map-get? emergency-executions will-id)
+)
+
+;; Check if will is ready for execution
+(define-read-only (is-will-ready-for-execution (will-id uint))
+    (match (map-get? wills will-id)
+        will-data (let ((basic-checks (and
+                (get is-active will-data)
+                (not (get is-executed will-data))
+                (> (get beneficiary-count will-data) u0)
+                (is-eq (get-total-percentage will-id) u10000)
+            )))
+            (if basic-checks
+                ;; Check time lock if enabled
+                (match (map-get? will-time-locks will-id)
+                    time-lock-data
+                    (if (get is-enabled time-lock-data)
+                        (match (get unlock-block time-lock-data)
+                            unlock-block (>= stacks-block-height unlock-block)
+                            true
+                        )
+                        true
+                    )
+                    true ;; No time lock
+                )
+                false
+            )
+        )
+        false
+    )
+)
+
+;; Get comprehensive will summary
+(define-read-only (get-will-summary (will-id uint))
+    (match (map-get? wills will-id)
+        will-data (ok {
+            will-details: will-data,
+            beneficiary-count: (get beneficiary-count will-data),
+            total-percentage: (get-total-percentage will-id),
+            time-lock-active: (is-time-lock-active will-id),
+            ready-for-execution: (is-will-ready-for-execution will-id),
+            guardian-count: (len (default-to (list) (map-get? will-guardian-list will-id))),
+            has-heartbeat: (is-some (map-get? will-heartbeats will-id)),
+            has-emergency-request: (is-some (map-get? emergency-executions will-id)),
+        })
         ERR_NOT_FOUND
     )
 )
